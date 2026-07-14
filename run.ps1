@@ -17,12 +17,14 @@
     (overwritten each run).
 
 .PARAMETER Action
-    InstallSkyTools, InstallSteamTools, InstallOpenSteamTools, Install, Uninstall, ExportPack,
+    InstallSkyTools, InstallSteamTools, InstallOpenSteamTools,
+    ReinstallSkyTools, ReinstallSteamTools, ReinstallOpenSteamTools,
+    Install, Reinstall, Uninstall, ExportPack,
     Download (alias for ExportPack), or LaunchSteam.
-    Legacy aliases: InstallOpenSteamTool, -Integration OpenSteamTool.
+    Legacy aliases: InstallOpenSteamTool, ReinstallOpenSteamTool, -Integration OpenSteamTool.
 
 .PARAMETER Integration
-    SkyTools, SteamTools, or OpenSteamTools — required for -Action Install; used by ExportPack.
+    SkyTools, SteamTools, or OpenSteamTools — required for -Action Install or Reinstall; used by ExportPack.
 
 .PARAMETER Force
     Skip confirmation prompts (install/uninstall when Steam is running, and uninstall file-removal prompt).
@@ -58,6 +60,9 @@
     .\run.ps1 -Action Uninstall -Force
 
 .EXAMPLE
+    .\run.ps1 -Action Reinstall -Integration SteamTools
+
+.EXAMPLE
     .\run.ps1 -Action ExportPack -Integration SteamTools -IncludeStPlugin
 #>
 
@@ -66,7 +71,8 @@ param(
         if ([string]::IsNullOrWhiteSpace($_)) { return $true }
         $_ -in @(
             'InstallSkyTools', 'InstallSteamTools', 'InstallOpenSteamTools', 'InstallOpenSteamTool',
-            'Install', 'Uninstall', 'ExportPack', 'Download', 'LaunchSteam'
+            'ReinstallSkyTools', 'ReinstallSteamTools', 'ReinstallOpenSteamTools', 'ReinstallOpenSteamTool',
+            'Install', 'Reinstall', 'Uninstall', 'ExportPack', 'Download', 'LaunchSteam'
         )
     })]
     [string]$Action,
@@ -85,6 +91,7 @@ if ([string]::IsNullOrWhiteSpace($Integration)) { $Integration = $null }
 
 if ($Integration -eq 'OpenSteamTool') { $Integration = 'OpenSteamTools' }
 if ($Action -eq 'InstallOpenSteamTool') { $Action = 'InstallOpenSteamTools' }
+if ($Action -eq 'ReinstallOpenSteamTool') { $Action = 'ReinstallOpenSteamTools' }
 
 # "irm | iex" has no script file path; interactive menus do not work there.
 # Download to a temp file and re-launch with -File in the same PowerShell host.
@@ -1614,6 +1621,195 @@ function Get-OpenSteamToolVersionLabel {
     return Get-DllBuildLabel (Join-Path $SteamPath 'OpenSteamTool.dll')
 }
 
+function Get-InstalledIntegrationType {
+    param([string]$SteamPath)
+
+    if (Test-OpenSteamTool $SteamPath) { return 'OpenSteamTools' }
+    if (Test-SkyTools $SteamPath) { return 'SkyTools' }
+    if (Test-Steamtools $SteamPath) { return 'SteamTools' }
+    return $null
+}
+
+function Get-LatestSkyToolsVersionLabel {
+    $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("SteamInstall.SkyVer." + [Guid]::NewGuid().ToString('N'))
+    New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+
+    try {
+        $dwmapiPath = Join-Path $tempDir 'dwmapi.dll'
+        $null = Save-RemoteFile -Urls @("$SkyToolsBaseUrl" + 'dwmapi.dll') -Destination $dwmapiPath -Quiet
+        return Get-DllBuildLabel $dwmapiPath
+    } finally {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-LatestSteamtoolsVersionLabel {
+    $tempDir = Join-Path ([IO.Path]::GetTempPath()) ("SteamInstall.STVer." + [Guid]::NewGuid().ToString('N'))
+    New-Item -Path $tempDir -ItemType Directory -Force | Out-Null
+
+    try {
+        $dwmapiPath = Join-Path $tempDir 'dwmapi.dll'
+        Save-SteamtoolsDll -Dll 'dwmapi' -Destination $dwmapiPath -Quiet
+        return Get-DllBuildLabel $dwmapiPath
+    } finally {
+        Remove-Item -LiteralPath $tempDir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-StartupVersionChecks {
+    param([string]$SteamPath)
+
+    $checks = [System.Collections.Generic.List[object]]::new()
+    $integration = Get-InstalledIntegrationType -SteamPath $SteamPath
+    $millDir = Join-Path $SteamPath 'millennium'
+
+    if ($integration -eq 'SkyTools') {
+        $checks.Add([PSCustomObject]@{
+            Key     = 'SkyTools'
+            Name    = 'SkyTools'
+            Current = Get-SkyToolsVersionLabel -SteamPath $SteamPath
+            Latest  = $null
+        })
+    } elseif ($integration -eq 'SteamTools') {
+        $checks.Add([PSCustomObject]@{
+            Key     = 'SteamTools'
+            Name    = 'SteamTools'
+            Current = Get-SteamtoolsVersionLabel -SteamPath $SteamPath
+            Latest  = $null
+        })
+    } elseif ($integration -eq 'OpenSteamTools') {
+        $checks.Add([PSCustomObject]@{
+            Key     = 'OpenSteamTools'
+            Name    = 'OpenSteamTools'
+            Current = Get-OpenSteamToolVersionLabel -SteamPath $SteamPath
+            Latest  = $null
+        })
+    }
+
+    if ($integration -in @('SkyTools', 'SteamTools')) {
+        $checks.Add([PSCustomObject]@{
+            Key     = 'Millennium'
+            Name    = 'Millennium'
+            Current = Get-MillenniumVersionLabel -SteamPath $SteamPath -MillDir $millDir
+            Latest  = $null
+        })
+
+        $pluginDir = Find-PluginDir -SteamPath $SteamPath -MillDir $millDir -Name $PluginName
+        if ($pluginDir) {
+            $checks.Add([PSCustomObject]@{
+                Key     = 'Luatools'
+                Name    = $PluginName
+                Current = Get-PluginVersionFromDir -PluginDir $pluginDir
+                Latest  = $null
+            })
+        }
+    }
+
+    foreach ($check in $checks) {
+        try {
+            switch ($check.Key) {
+                'SkyTools' {
+                    $check.Latest = Get-LatestSkyToolsVersionLabel
+                }
+                'SteamTools' {
+                    $check.Latest = Get-LatestSteamtoolsVersionLabel
+                }
+                'OpenSteamTools' {
+                    $check.Latest = (Get-LatestOpenSteamToolAsset).Version
+                }
+                'Millennium' {
+                    $check.Latest = Get-GithubLatestTag -Repo $MillenniumGithubRepo
+                }
+                'Luatools' {
+                    $check.Latest = Get-GithubLatestTag -Repo $LuatoolsGithubRepo
+                }
+            }
+        } catch {
+            Write-Log "Could not check latest $($check.Name) version: $($_.Exception.Message)"
+        }
+    }
+
+    return $checks
+}
+
+function Invoke-StartupUpdateCheck {
+    param([switch]$Interactive)
+
+    $steamPath = $null
+    try {
+        $steamPath = Get-SteamPath
+    } catch {
+        Write-Step WARN 'Could not locate Steam for startup update check. Skipping.'
+        return
+    }
+
+    $checks = Get-StartupVersionChecks -SteamPath $steamPath
+    if (-not $checks.Count) {
+        Write-Step INFO 'No supported integration detected for startup update check.'
+        return
+    }
+
+    Write-Host ''
+    Write-Out '=== Version check ===' -ForegroundColor Cyan
+
+    $updateCandidates = [System.Collections.Generic.List[object]]::new()
+
+    foreach ($check in $checks) {
+        $current = Format-VersionLabel $check.Current
+        $latest = Format-VersionLabel $check.Latest
+        Write-Step INFO "$($check.Name): current $current | latest $latest"
+
+        if ($check.Latest -and (Test-VersionUpdateNeeded -Installed $check.Current -Latest $check.Latest)) {
+            $updateCandidates.Add($check)
+        }
+    }
+
+    if (-not $updateCandidates.Count) {
+        Write-Step OK 'Everything is already up to date.'
+        return
+    }
+
+    if (-not $Interactive) {
+        Write-Step INFO 'Updates are available. Run interactive mode to choose updates.'
+        return
+    }
+
+    $steamStopped = $false
+    foreach ($candidate in $updateCandidates) {
+        $current = Format-VersionLabel $candidate.Current
+        $latest = Format-VersionLabel $candidate.Latest
+        $answer = Read-ManagerInput "Update $($candidate.Name) from $current to $latest? [Y/n]" -Question
+        if ($answer -and ($answer.Trim() -match '^n(o)?$')) {
+            continue
+        }
+
+        if (-not $steamStopped) {
+            Stop-Steam
+            $steamStopped = $true
+        }
+
+        switch ($candidate.Key) {
+            'SkyTools' {
+                Sync-SkyTools -SteamPath $steamPath
+            }
+            'SteamTools' {
+                $steamtoolsUpdated = Sync-Steamtools -SteamPath $steamPath
+                Sync-STFixerSupport -SteamPath $steamPath -Reapply:$steamtoolsUpdated -SkipUserPrompt
+            }
+            'OpenSteamTools' {
+                Sync-OpenSteamTool -SteamPath $steamPath
+            }
+            'Millennium' {
+                Install-Millennium -SteamPath $steamPath -TargetVersion $candidate.Latest
+            }
+            'Luatools' {
+                $millDir = Join-Path $steamPath 'millennium'
+                Install-Luatools -SteamPath $steamPath -MillDir $millDir -Name $PluginName -TargetVersion $candidate.Latest
+            }
+        }
+    }
+}
+
 function Get-LatestOpenSteamToolAsset {
     # Resolves browser_download_url from the latest GitHub release (*-Release.zip asset only).
     $release = Invoke-RestMethod `
@@ -2120,6 +2316,23 @@ function Start-SteamtoolsInstallFlow {
     $steamtoolsUpdated = Sync-Steamtools -SteamPath $steamPath
     Sync-STFixerSupport -SteamPath $steamPath -Reapply:$steamtoolsUpdated -SkipUserPrompt:$Force
     Install-MillenniumAndLuatools -SteamPath $steamPath
+}
+
+function Start-ReinstallFlow {
+    param(
+        [ValidateSet('SkyTools', 'SteamTools', 'OpenSteamTools')]
+        [string]$Integration,
+        [switch]$Force
+    )
+
+    Write-Step INFO "Reinstall requested for $Integration"
+    Start-UninstallFlow -Force:$Force
+
+    switch ($Integration) {
+        'SkyTools' { Start-SkyToolsInstallFlow -Force:$Force }
+        'SteamTools' { Start-SteamtoolsInstallFlow -Force:$Force }
+        'OpenSteamTools' { Start-OpenSteamToolInstallFlow -Force:$Force }
+    }
 }
 
 # =============================================================================
@@ -2698,17 +2911,18 @@ function Write-MenuHeader {
     Write-Host ''
     Write-Out "=== $script:ManagerTitle ===" -ForegroundColor Cyan -NoLog
     Write-Host ''
-    Write-Out (Format-MenuOptionLine '1' 'Install' 'SkyTools, SteamTools, or OpenSteamTools' 16) -NoLog
-    Write-Out (Format-MenuOptionLine '2' 'Uninstall' 'Remove installed components' 16) -NoLog
-    Write-Out (Format-MenuOptionLine '3' 'Export pack' 'Build offline bundle for manual install' 16) -NoLog
-    Write-Out (Format-MenuOptionLine '4' 'Launch Steam' 'Open the Steam client' 16) -NoLog
+    Write-Out (Format-MenuOptionLine '1' 'Install/Update' 'SkyTools, SteamTools, or OpenSteamTools' 16) -NoLog
+    Write-Out (Format-MenuOptionLine '2' 'Clean Reinstall' 'Uninstall then install selected integration' 16) -NoLog
+    Write-Out (Format-MenuOptionLine '3' 'Uninstall' 'Remove installed components' 16) -NoLog
+    Write-Out (Format-MenuOptionLine '4' 'Export pack' 'Build offline bundle for manual install' 16) -NoLog
+    Write-Out (Format-MenuOptionLine '5' 'Launch Steam' 'Open the Steam client' 16) -NoLog
     Write-Out (Format-MenuOptionLine '0' 'Exit' 'Close this window' 16) -ForegroundColor DarkGray -NoLog
     Write-Host ''
 }
 
 function Write-InstallSubMenuHeader {
     Write-Host ''
-    Write-Out '=== Install ===' -ForegroundColor Cyan -NoLog
+    Write-Out '=== Install / Update ===' -ForegroundColor Cyan -NoLog
     Write-Host ''
     Write-Out (Format-MenuOptionLine '1' 'SkyTools' 'SkyTools, Millennium, and Luatools (install or update)' 18) -NoLog
     Write-Out (Format-MenuOptionLine '2' 'SteamTools' 'SteamTools, Millennium, and Luatools (optional STFixer)' 18) -NoLog
@@ -2724,6 +2938,17 @@ function Write-ExportSubMenuHeader {
     Write-Out (Format-MenuOptionLine '1' 'SkyTools' 'SkyTools, Millennium, and Luatools' 18) -NoLog
     Write-Out (Format-MenuOptionLine '2' 'SteamTools' 'SteamTools, Millennium, and Luatools (optional STFixer)' 18) -NoLog
     Write-Out (Format-MenuOptionLine '3' 'OpenSteamTools' 'Defender exclusion and cleanup prompt' 18) -NoLog
+    Write-Out (Format-MenuOptionLine '0' 'Back' 'Return to main menu' 18) -ForegroundColor DarkGray -NoLog
+    Write-Host ''
+}
+
+function Write-ReinstallSubMenuHeader {
+    Write-Host ''
+    Write-Out '=== Clean Reinstall ===' -ForegroundColor Cyan -NoLog
+    Write-Host ''
+    Write-Out (Format-MenuOptionLine '1' 'SkyTools' 'Reinstall SkyTools stack' 18) -NoLog
+    Write-Out (Format-MenuOptionLine '2' 'SteamTools' 'Reinstall SteamTools stack' 18) -NoLog
+    Write-Out (Format-MenuOptionLine '3' 'OpenSteamTools' 'Reinstall OpenSteamTools' 18) -NoLog
     Write-Out (Format-MenuOptionLine '0' 'Back' 'Return to main menu' 18) -ForegroundColor DarkGray -NoLog
     Write-Host ''
 }
@@ -2762,8 +2987,25 @@ function Read-ExportSubMenuChoice {
     }
 }
 
+function Read-ReinstallSubMenuChoice {
+    $choice = Read-ManagerMenuKey -Prompt 'Select reinstall option [1-3]' -ValidChoices @('0', '1', '2', '3') -InvalidChoiceMessage 'Invalid choice. Enter 1, 2, or 3.' -NoLog
+    if (-not $choice) {
+        Clear-Host
+        return $null
+    }
+    switch ($choice) {
+        '0' {
+            Clear-Host
+            return 'Back'
+        }
+        '1' { return 'ReinstallSkyTools' }
+        '2' { return 'ReinstallSteamTools' }
+        '3' { return 'ReinstallOpenSteamTools' }
+    }
+}
+
 function Read-MenuChoice {
-    $choice = Read-ManagerMenuKey -Prompt 'Select an option [1-4]' -ValidChoices @('0', '1', '2', '3', '4') -InvalidChoiceMessage 'Invalid choice. Enter 1, 2, 3, or 4.' -NoLog
+    $choice = Read-ManagerMenuKey -Prompt 'Select an option [1-5]' -ValidChoices @('0', '1', '2', '3', '4', '5') -InvalidChoiceMessage 'Invalid choice. Enter 1, 2, 3, 4, or 5.' -NoLog
     if (-not $choice) {
         Clear-Host
         return $null
@@ -2778,8 +3020,16 @@ function Read-MenuChoice {
                 if ($subChoice) { return $subChoice }
             }
         }
-        '2' { return 'Uninstall' }
-        '3' {
+        '2' {
+            while ($true) {
+                Write-ReinstallSubMenuHeader
+                $subChoice = Read-ReinstallSubMenuChoice
+                if ($subChoice -eq 'Back') { return $null }
+                if ($subChoice) { return $subChoice }
+            }
+        }
+        '3' { return 'Uninstall' }
+        '4' {
             while ($true) {
                 Write-ExportSubMenuHeader
                 $subChoice = Read-ExportSubMenuChoice
@@ -2790,34 +3040,34 @@ function Read-MenuChoice {
                 }
             }
         }
-        '4' { return 'LaunchSteam' }
+        '5' { return 'LaunchSteam' }
     }
 }
 
 function Get-ExitArtLines {
     return @(
-        '                   ..                   '
-        '            ^jp%$$$$$$$$Bdx"            '
-        '         ,W$$$$$$$$$$$$$$$$$$&;         '
-        '       [%$$$$$$$$$$$$$$$$$$$$$$B1       '
-        '     ^M$$$$$$$$$$$$$$$$$&bdW@$$$$&"     '
-        '    {@$$$$$$$$$$$$$$@U        nB$$@(    '
-        '   [@$$$$$$$$$$$$$$$" ,dWzvMhI ^M$$$|   '
-        '  ,$$$$$$$$$$$$$$$@l <B"     *} <$$$$>  '
-        '  h$$$$$$$$$$$$$$$8  Qc      nQ ^$$$$a  '
-        ' ;$$$$$$$$$$$$$$$a   ;B!     W? +$$$$$i '
-        ' `CM@$$$$$$$$$$$C     .m@ak@b" ,%$$$$$[ '
-        '     '']b$$$$$$$(              C@$$$$$$[ '
-        '          ^d^ ''          jB@$$$$$$$$$$i '
-        '              "x8{    +a$$$$$$$$$$$$$o  '
-        '  :%w,          ^@: CB$$$$$$$$$$$$$$$<  '
-        '   {@$$@k<      ;B^w$$$$$$$$$$$$$$$$/   '
-        '    {@$$$%I-#LXbMl{$$$$$$$$$$$$$$$@(    '
-        '     "&$$$$%?"^,fB$$$$$$$$$$$$$$$8"     '
-        '       {B$$$$$$$$$$$$$$$$$$$$$$B|       '
-        '         ;W$$$$$$$$$$$$$$$$$$&!         '
-        '            "nbB$$$$$$$$Bkv,            '
-        '                   ...                  '
+        '                   ...'
+        '            ^jp%$$$$$$$$Bdx"'
+        '         ,W$$$$$$$$$$$$$$$$$$&;'
+        '       [%$$$$$$$$$$$$$$$$$$$$$$B1'
+        '     ^M$$$$$J$$$$$$$$$$$&bdW@$$$$&"'
+        '    {@$$$$$$$$$$$$$$@U        nB$$@('
+        '   [@$$$$$$$$$$$$$$$" ,dWzvMhI ^M$$$|'
+        '  ,$$$$$$$$$$$$$$$@l <B"     *} <$$$$>'
+        '  h$$$$$$$$$$$$$$$8  Qc      nQ ^$$$$a'
+        ' ;$$$$$$$$$$$$$$$a   ;B!     W? +$$$$$i'
+        ' `CM@$$$$$$$$$$$C     .m@ak@b" ,%$$$$$['
+        '     '']b$$$$$$$(              C@$$$$$$['
+        '          ^d^ ''          jB@$$$$$$$$$$i'
+        '              "x8{    +a$$$$$$$$M$$$$o'
+        '  :%w,          ^@: CB$$$$$$$$$$$$$$$<'
+        '   {@$$@k<      ;B^w$$$$$$$$$$$$$$$$/'
+        '    {@$$$%I-#LXbMl{$$$$$$$$$$$$$$$@('
+        '     "&$$$$%?"^,fB$$$$$$B$$$$$$$$8"'
+        '       {B$$$$$$$$$$$$$$$$$$$$$$B|'
+        '         ;W$$$$$$$$$$$$$$$$$$&!'
+        '            "nbB$$$$$$$$$kv,'
+        '                   ...'
     )
 }
 
@@ -2907,6 +3157,16 @@ function Invoke-ManagerAction {
         'InstallSkyTools' { Start-SkyToolsInstallFlow -Force:$Force }
         'InstallSteamTools' { Start-SteamtoolsInstallFlow -Force:$Force }
         'InstallOpenSteamTools' { Start-OpenSteamToolInstallFlow -Force:$Force }
+        'ReinstallSkyTools' { Start-ReinstallFlow -Integration 'SkyTools' -Force:$Force }
+        'ReinstallSteamTools' { Start-ReinstallFlow -Integration 'SteamTools' -Force:$Force }
+        'ReinstallOpenSteamTools' { Start-ReinstallFlow -Integration 'OpenSteamTools' -Force:$Force }
+        'Reinstall' {
+            if ($Integration -in @('SkyTools', 'SteamTools', 'OpenSteamTools')) {
+                Start-ReinstallFlow -Integration $Integration -Force:$Force
+            } else {
+                throw 'Reinstall requires -Integration SkyTools, SteamTools, or OpenSteamTools.'
+            }
+        }
         'Uninstall' { Start-UninstallFlow -Force:$Force }
         { $_ -in 'ExportPack', 'Download' } {
             # From the menu, PromptForOutputDir also gates the export follow-up prompts (scripts, zip, integration).
@@ -2946,6 +3206,8 @@ try {
 
     $fromMenu = [string]::IsNullOrWhiteSpace($Action)
 
+    Invoke-StartupUpdateCheck -Interactive:$fromMenu
+
     # Normalize legacy/generic action names
     if ($Action -eq 'Download') { $Action = 'ExportPack' }
     if ($Action -eq 'Install') {
@@ -2953,6 +3215,12 @@ try {
         elseif ($Integration -eq 'SteamTools') { $Action = 'InstallSteamTools' }
         elseif ($Integration -eq 'OpenSteamTools') { $Action = 'InstallOpenSteamTools' }
         else { throw 'Install requires -Integration SkyTools, SteamTools, or OpenSteamTools.' }
+    }
+    if ($Action -eq 'Reinstall') {
+        if ($Integration -eq 'SkyTools') { $Action = 'ReinstallSkyTools' }
+        elseif ($Integration -eq 'SteamTools') { $Action = 'ReinstallSteamTools' }
+        elseif ($Integration -eq 'OpenSteamTools') { $Action = 'ReinstallOpenSteamTools' }
+        else { throw 'Reinstall requires -Integration SkyTools, SteamTools, or OpenSteamTools.' }
     }
 
     if ($fromMenu) {
@@ -2983,7 +3251,7 @@ try {
                     $script:MenuIntegration = $null
                     Write-ActionBoundary -Action $menuChoice -Phase completed
 
-                    if ($menuChoice -in 'InstallSkyTools', 'InstallSteamTools', 'InstallOpenSteamTools') {
+                    if ($menuChoice -in 'InstallSkyTools', 'InstallSteamTools', 'InstallOpenSteamTools', 'ReinstallSkyTools', 'ReinstallSteamTools', 'ReinstallOpenSteamTools') {
                         $postInstall = Invoke-PostInstallSteamPrompt -FromMenu
                         if ($postInstall -eq 'Exit') {
                             Invoke-ManagerExit
@@ -3027,7 +3295,7 @@ try {
             Invoke-ManagerAction @invokeParams
             Write-ActionBoundary -Action $Action -Phase completed
 
-            if ($Action -in 'InstallSkyTools', 'InstallSteamTools', 'InstallOpenSteamTools') {
+            if ($Action -in 'InstallSkyTools', 'InstallSteamTools', 'InstallOpenSteamTools', 'ReinstallSkyTools', 'ReinstallSteamTools', 'ReinstallOpenSteamTools') {
                 $postInstall = Invoke-PostInstallSteamPrompt
                 if ($postInstall -eq 'Exit') {
                     Invoke-ManagerExit
